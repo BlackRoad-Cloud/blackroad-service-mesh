@@ -1,51 +1,77 @@
-# BlackRoad Service Mesh
+# blackroad-service-mesh
 
-> Service discovery, intelligent traffic routing, circuit breaking, and health monitoring.
+> Production-quality service mesh with load balancing, traffic policies, circuit breaking, and topology export.
 
 ## Features
 
-- `Service` dataclass (name, host, port, protocol, health_endpoint, weight)
-- `TrafficPolicy` (retries, timeout_ms, circuit_breaker_threshold, lb_algorithm)
-- `register_service()`, `deregister_service()` — service registry
-- `route_request()` — request routing with load balancing and circuit breaker enforcement
-- `circuit_breaker_state()` — CLOSED → OPEN → HALF_OPEN state machine
-- `health_check_all()` — HTTP health checks across all services
-- `get_service_graph()` — adjacency dict from route log
-- `get_traffic_stats()` — error rate, avg latency, top routes
-- SQLite persistence (services, circuit breakers, route log, health log)
-- CLI: `register`, `list`, `route`, `health`, `graph`, `stats`, `deregister`
+- **Service registration** with multiple endpoints and namespace isolation
+- **Load balancing**: round_robin, least_conn, random
+- **Traffic policies** per source→destination pair with weight, timeout, retries
+- **Circuit breaker** — CLOSED / OPEN / HALF_OPEN state machine
+- **Mesh topology** — graph of all services and edges
+- **Config export** — full mesh snapshot as JSON
+- **Health checking** via HTTP/HTTPS probe
+- **SQLite persistence** — `~/.blackroad/service_mesh.db`
 
-## Usage
+## Quick start
 
 ```bash
-# Register services
-python src/service_mesh.py register --name api-gateway --host gw.internal --port 8080
-python src/service_mesh.py register --name user-service --host users.internal --port 3001
-python src/service_mesh.py register --name order-service --host orders.internal --port 3002 --namespace prod
-
-# Route a request
-python src/service_mesh.py route api-gateway user-service --path /users/me
-
-# Health check all
-python src/service_mesh.py health
-
-# View service graph
-python src/service_mesh.py graph
-
-# Traffic stats
-python src/service_mesh.py stats
+pip install -r requirements.txt
+python src/service_mesh.py register api --endpoints 10.0.0.1:8080,10.0.0.2:8080 --protocol http --port 8080
+python src/service_mesh.py list
+python src/service_mesh.py route frontend api
+python src/service_mesh.py topology
+python src/service_mesh.py export
 ```
 
-## Circuit Breaker States
+## API
 
-```
-CLOSED ──(failures >= threshold)──► OPEN ──(timeout expired)──► HALF_OPEN
-  ▲                                                                  │
-  └──────────────────(success)──────────────────────────────────────┘
+```python
+from src.service_mesh import register_service, route, apply_policy, mesh_topology, export_config
+
+db = _get_db()
+
+# Register
+svc = register_service("api", ["10.0.0.1", "10.0.0.2"], "http", 8080, db=db)
+
+# Route (round robin by default)
+result = route("frontend", "api", db=db)
+print(result.endpoint, result.latency_ms)
+
+# Traffic policy
+policy = apply_policy("frontend", "api",
+    weight=100, timeout_ms=3000, retry_count=3,
+    circuit_breaker_threshold=5, db=db)
+
+# Check circuit breaker
+cb = check_circuit_breaker(policy.id, db=db)
+print(cb["circuit_state"])   # closed / open / half_open
+
+# Record outcome
+record_outcome("frontend", "api", success=False, db=db)
+
+# Topology
+topo = mesh_topology(db=db)
+# {"nodes": [...], "edges": [...]}
+
+# Export full config
+cfg = export_config(db=db)
 ```
 
-## Tests
+## Testing
 
 ```bash
-pytest tests/ -v --cov=src
+pytest tests/ -v
+```
+
+## Architecture
+
+```
+Services ──register──▶ SQLite
+    │
+    └──route──▶ LoadBalancer (rr/lc/random)
+                    │
+                    └──▶ TrafficPolicy check
+                              │
+                              └──▶ CircuitBreaker state machine
 ```
