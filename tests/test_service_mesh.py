@@ -1,178 +1,184 @@
-"""Tests for BlackRoad Service Mesh."""
+"""Tests for service_mesh.py"""
+import json
+import time
 import pytest
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
 from service_mesh import (
-    Service, TrafficPolicy, CircuitBreakerState, CircuitState, Protocol,
     register_service, deregister_service, get_service, list_services,
-    circuit_breaker_state, route_request, health_check_all, get_service_graph,
-    get_traffic_stats, _init_db,
+    apply_policy, list_policies, check_circuit_breaker, route,
+    mesh_topology, export_config, health_check, record_outcome,
+    _get_db, Protocol, LoadBalance, CircuitState,
 )
 
 
-def make_db(tmp_path):
-    return _init_db(tmp_path / "test_mesh.db")
+@pytest.fixture
+def db(tmp_path):
+    return _get_db(tmp_path / "test_mesh.db")
 
 
-def make_svc(**kwargs):
-    defaults = dict(name="api", host="localhost", port=8080)
-    defaults.update(kwargs)
-    return Service(**defaults)
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+def test_register_service(db):
+    svc = register_service("api", ["10.0.0.1"], "http", 8080, db=db)
+    assert svc.name == "api"
+    assert svc.protocol == "http"
+    assert svc.port == 8080
 
 
-class TestTrafficPolicy:
-    def test_defaults(self):
-        p = TrafficPolicy()
-        assert p.retries == 3
-        assert p.timeout_ms == 5000
-
-    def test_invalid_retries(self):
-        with pytest.raises(ValueError):
-            TrafficPolicy(retries=-1)
-
-    def test_invalid_timeout(self):
-        with pytest.raises(ValueError):
-            TrafficPolicy(timeout_ms=0)
-
-    def test_invalid_threshold(self):
-        with pytest.raises(ValueError):
-            TrafficPolicy(circuit_breaker_threshold=0)
+def test_register_service_defaults(db):
+    svc = register_service("web", ["10.0.0.2"], "https", 443, db=db)
+    assert svc.health_check_path == "/health"
+    assert svc.load_balance == LoadBalance.ROUND_ROBIN.value
 
 
-class TestService:
-    def test_basic_service(self):
-        svc = make_svc()
-        assert svc.name == "api"
-        assert svc.port == 8080
-
-    def test_invalid_port(self):
-        with pytest.raises(ValueError):
-            make_svc(port=0)
-
-    def test_base_url(self):
-        svc = make_svc(host="api.internal", port=9000)
-        assert svc.base_url == "http://api.internal:9000"
-
-    def test_https_protocol(self):
-        svc = make_svc(protocol=Protocol.HTTPS, port=443)
-        assert "https" in svc.base_url
-
-    def test_health_url(self):
-        svc = make_svc(host="db", port=5432, health_endpoint="/ping")
-        assert svc.health_url == "http://db:5432/ping"
-
-    def test_empty_name(self):
-        with pytest.raises(ValueError):
-            make_svc(name="")
-
-    def test_invalid_weight(self):
-        with pytest.raises(ValueError):
-            make_svc(weight=0)
+def test_register_service_upsert(db):
+    svc1 = register_service("svc", ["ep1"], "http", 80, db=db)
+    svc2 = register_service("svc", ["ep2"], "http", 80, db=db)
+    assert svc1.name == svc2.name
+    svcs = list_services(db=db)
+    assert sum(1 for s in svcs if s.name == "svc") == 1
 
 
-class TestCircuitBreakerState:
-    def test_initial_closed(self):
-        cb = CircuitBreakerState(service="api")
-        assert cb.state == CircuitState.CLOSED
-
-    def test_opens_after_threshold(self):
-        policy = TrafficPolicy(circuit_breaker_threshold=3)
-        cb = CircuitBreakerState(service="api")
-        for _ in range(3):
-            cb.record_failure(policy)
-        assert cb.state == CircuitState.OPEN
-
-    def test_is_open_returns_false_when_closed(self):
-        policy = TrafficPolicy()
-        cb = CircuitBreakerState(service="api")
-        assert cb.is_open(policy) is False
-
-    def test_record_success_resets(self):
-        policy = TrafficPolicy(circuit_breaker_threshold=2)
-        cb = CircuitBreakerState(service="api")
-        cb.record_failure(policy)
-        cb.record_failure(policy)
-        assert cb.state == CircuitState.OPEN
-        cb.record_success()
-        assert cb.state == CircuitState.CLOSED
-        assert cb.failure_count == 0
+def test_deregister_service(db):
+    register_service("gone", ["x"], "http", 80, db=db)
+    ok = deregister_service("gone", db=db)
+    assert ok
+    assert get_service("gone", db=db) is None
 
 
-class TestRegisterService:
-    def test_register(self, tmp_path):
-        db = make_db(tmp_path)
-        svc = make_svc(name="auth", host="auth-svc", port=8001)
-        sid = register_service(svc, db)
-        assert sid > 0
-
-    def test_upsert_on_re_register(self, tmp_path):
-        db = make_db(tmp_path)
-        svc = make_svc(name="auth", host="auth-svc", port=8001)
-        register_service(svc, db)
-        register_service(svc, db)
-        services = list_services(db=db)
-        assert len(services) == 1
-
-    def test_get_service(self, tmp_path):
-        db = make_db(tmp_path)
-        svc = make_svc(name="orders", host="orders-svc", port=8002)
-        register_service(svc, db)
-        fetched = get_service("orders", db)
-        assert fetched is not None
-        assert fetched.host == "orders-svc"
-
-    def test_deregister(self, tmp_path):
-        db = make_db(tmp_path)
-        svc = make_svc(name="payments")
-        register_service(svc, db)
-        result = deregister_service("payments", db)
-        assert result is True
-        assert get_service("payments", db) is None
-
-    def test_deregister_nonexistent(self, tmp_path):
-        db = make_db(tmp_path)
-        result = deregister_service("ghost", db)
-        assert result is False
+def test_list_services_filtered(db):
+    register_service("s1", ["e1"], "http", 80, namespace="prod", db=db)
+    register_service("s2", ["e2"], "http", 80, namespace="dev", db=db)
+    prod = list_services(namespace="prod", db=db)
+    assert all(s.namespace == "prod" for s in prod)
 
 
-class TestRouteRequest:
-    def test_successful_route(self, tmp_path):
-        db = make_db(tmp_path)
-        register_service(make_svc(name="frontend", host="fe", port=3000), db)
-        register_service(make_svc(name="backend", host="be", port=8080), db)
-        result = route_request("frontend", "backend", "/api", db=db)
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+
+def test_route_round_robin(db):
+    register_service("backend", ["ep1", "ep2", "ep3"], "http", 9000,
+                     load_balance=LoadBalance.ROUND_ROBIN.value, db=db)
+    endpoints = set()
+    for _ in range(6):
+        result = route("frontend", "backend", db=db)
         assert result.success
-        assert result.source == "frontend"
-        assert result.destination == "backend"
-
-    def test_route_to_nonexistent_fails(self, tmp_path):
-        db = make_db(tmp_path)
-        result = route_request("a", "nonexistent", db=db)
-        assert not result.success
-        assert "not found" in result.error
-
-    def test_route_log_recorded(self, tmp_path):
-        db = make_db(tmp_path)
-        register_service(make_svc(name="svc-a", host="a", port=8080), db)
-        register_service(make_svc(name="svc-b", host="b", port=8081), db)
-        route_request("svc-a", "svc-b", db=db)
-        route_request("svc-a", "svc-b", db=db)
-        graph = get_service_graph(db)
-        assert "svc-a" in graph
-        assert "svc-b" in graph["svc-a"]
-        assert graph["svc-a"]["svc-b"]["calls"] == 2
+        endpoints.add(result.endpoint)
+    assert len(endpoints) > 1  # used multiple endpoints
 
 
-class TestServiceGraph:
-    def test_empty_graph(self, tmp_path):
-        db = make_db(tmp_path)
-        graph = get_service_graph(db)
-        assert graph == {}
+def test_route_random(db):
+    register_service("rand-svc", ["a", "b", "c"], "http", 80,
+                     load_balance=LoadBalance.RANDOM.value, db=db)
+    for _ in range(5):
+        r = route("caller", "rand-svc", db=db)
+        assert r.success
+        assert r.endpoint in ["a", "b", "c"]
 
-    def test_traffic_stats(self, tmp_path):
-        db = make_db(tmp_path)
-        register_service(make_svc(name="a", host="a", port=80), db)
-        register_service(make_svc(name="b", host="b", port=81), db)
-        for _ in range(5):
-            route_request("a", "b", db=db)
-        stats = get_traffic_stats(db)
-        assert stats["total_requests"] == 5
-        assert stats["avg_latency_ms"] >= 0
+
+def test_route_unknown_service(db):
+    result = route("src", "nonexistent", db=db)
+    assert not result.success
+    assert "not found" in result.error
+
+
+# ---------------------------------------------------------------------------
+# Traffic policies
+# ---------------------------------------------------------------------------
+
+def test_apply_policy(db):
+    p = apply_policy("frontend", "backend", weight=100, timeout_ms=3000, db=db)
+    assert p.source == "frontend"
+    assert p.destination == "backend"
+    assert p.timeout_ms == 3000
+
+
+def test_apply_policy_upsert(db):
+    apply_policy("a", "b", timeout_ms=1000, db=db)
+    p2 = apply_policy("a", "b", timeout_ms=2000, db=db)
+    policies = list_policies(db=db)
+    ab = [p for p in policies if p.source == "a" and p.destination == "b"]
+    assert len(ab) == 1
+
+
+def test_check_circuit_breaker(db):
+    register_service("target", ["ep1"], "http", 80, db=db)
+    p = apply_policy("caller", "target", circuit_breaker_threshold=3, db=db)
+    cb = check_circuit_breaker(p.id, db=db)
+    assert cb["circuit_state"] == CircuitState.CLOSED.value
+    assert cb["failure_count"] == 0
+
+
+def test_check_circuit_breaker_invalid(db):
+    result = check_circuit_breaker("bad-id", db=db)
+    assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker state changes
+# ---------------------------------------------------------------------------
+
+def test_record_failures_opens_circuit(db):
+    register_service("flaky", ["ep"], "http", 80, db=db)
+    p = apply_policy("c", "flaky", circuit_breaker_threshold=3, db=db)
+    for _ in range(3):
+        record_outcome("c", "flaky", success=False, db=db)
+    cb = check_circuit_breaker(p.id, db=db)
+    assert cb["circuit_state"] == CircuitState.OPEN.value
+
+
+def test_record_success_resets_circuit(db):
+    register_service("ok-svc", ["ep"], "http", 80, db=db)
+    p = apply_policy("c2", "ok-svc", circuit_breaker_threshold=3, db=db)
+    for _ in range(3):
+        record_outcome("c2", "ok-svc", success=False, db=db)
+    record_outcome("c2", "ok-svc", success=True, db=db)
+    cb = check_circuit_breaker(p.id, db=db)
+    assert cb["circuit_state"] == CircuitState.CLOSED.value
+
+
+# ---------------------------------------------------------------------------
+# Topology & export
+# ---------------------------------------------------------------------------
+
+def test_mesh_topology_structure(db):
+    register_service("t1", ["e1"], "http", 80, db=db)
+    register_service("t2", ["e2"], "http", 80, db=db)
+    apply_policy("t1", "t2", db=db)
+    topo = mesh_topology(db=db)
+    assert "nodes" in topo
+    assert "edges" in topo
+    assert topo["service_count"] >= 2
+    assert topo["policy_count"] >= 1
+
+
+def test_export_config_structure(db):
+    register_service("ex1", ["e1"], "http", 80, db=db)
+    cfg = export_config(db=db)
+    assert "version" in cfg
+    assert "topology" in cfg
+    assert "exported_at" in cfg
+
+
+# ---------------------------------------------------------------------------
+# Service data model
+# ---------------------------------------------------------------------------
+
+def test_service_base_url():
+    from service_mesh import Service
+    svc = Service(name="x", namespace="default", endpoints=["10.0.0.1"],
+                  protocol="https", port=8443)
+    assert svc.base_url() == "https://10.0.0.1:8443"
+
+
+def test_service_health_url():
+    from service_mesh import Service
+    svc = Service(name="x", namespace="default", endpoints=["10.0.0.1"],
+                  protocol="http", port=80, health_check_path="/ping")
+    assert svc.health_url() == "http://10.0.0.1:80/ping"
