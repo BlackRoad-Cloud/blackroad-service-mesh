@@ -1,49 +1,47 @@
 """
 BlackRoad Service Mesh
-Production-quality service mesh with load balancing, circuit breaking,
-health checking, and request routing.
+Production-quality service mesh with load balancing, traffic policies,
+circuit breaking, health checking, topology export, and config export.
 """
 
 from __future__ import annotations
-import argparse
+
 import json
 import random
 import sqlite3
-import sys
 import time
-import urllib.request
-import urllib.error
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
-
+from typing import Any, Optional
+import urllib.request
+import urllib.error
 
 DB_PATH = Path.home() / ".blackroad" / "service_mesh.db"
-
 
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
 
 class Protocol(str, Enum):
-    HTTP = "http"
+    HTTP  = "http"
     HTTPS = "https"
-    GRPC = "grpc"
-    TCP = "tcp"
+    GRPC  = "grpc"
+    TCP   = "tcp"
+
+
+class LoadBalance(str, Enum):
+    ROUND_ROBIN = "round_robin"
+    LEAST_CONN  = "least_conn"
+    RANDOM      = "random"
+    WEIGHTED    = "weighted"
 
 
 class CircuitState(str, Enum):
-    CLOSED = "closed"       # Normal operation
-    OPEN = "open"           # Failing, reject all
-    HALF_OPEN = "half_open" # Testing recovery
-
-
-class LoadBalanceAlgo(str, Enum):
-    ROUND_ROBIN = "round_robin"
-    RANDOM = "random"
-    LEAST_CONN = "least_connections"
-    WEIGHTED = "weighted"
+    CLOSED    = "closed"
+    OPEN      = "open"
+    HALF_OPEN = "half_open"
 
 
 # ---------------------------------------------------------------------------
@@ -51,382 +49,534 @@ class LoadBalanceAlgo(str, Enum):
 # ---------------------------------------------------------------------------
 
 @dataclass
-class TrafficPolicy:
-    retries: int = 3
-    timeout_ms: int = 5000
-    circuit_breaker_threshold: int = 5   # failures before opening
-    circuit_breaker_window: int = 60      # seconds
-    circuit_breaker_timeout: int = 30     # seconds before half-open
-    lb_algorithm: LoadBalanceAlgo = LoadBalanceAlgo.ROUND_ROBIN
-    max_connections: int = 100
-    rate_limit_rps: int = 0               # 0 = unlimited
+class Service:
+    name: str
+    namespace: str
+    endpoints: list[str]
+    protocol: str
+    port: int
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    health_check_path: str = "/health"
+    load_balance: str = LoadBalance.ROUND_ROBIN.value
+    weight: int = 1
+    created_at: float = field(default_factory=time.time)
+    metadata: dict = field(default_factory=dict)
 
-    def __post_init__(self):
-        if self.retries < 0:
-            raise ValueError("retries must be >= 0")
-        if self.timeout_ms < 1:
-            raise ValueError("timeout_ms must be >= 1")
-        if self.circuit_breaker_threshold < 1:
-            raise ValueError("circuit_breaker_threshold must be >= 1")
+    def base_url(self, endpoint: Optional[str] = None) -> str:
+        ep = endpoint or (self.endpoints[0] if self.endpoints else "localhost")
+        return f"{self.protocol}://{ep}:{self.port}"
+
+    def health_url(self, endpoint: Optional[str] = None) -> str:
+        return f"{self.base_url(endpoint)}{self.health_check_path}"
 
 
 @dataclass
-class Service:
-    name: str
-    host: str
-    port: int
-    protocol: Protocol = Protocol.HTTP
-    health_endpoint: str = "/health"
-    version: str = "v1"
-    namespace: str = "default"
-    weight: int = 1
-    metadata: dict = field(default_factory=dict)
-    policy: TrafficPolicy = field(default_factory=TrafficPolicy)
-
-    def __post_init__(self):
-        if not self.name:
-            raise ValueError("Service name cannot be empty")
-        if not (1 <= self.port <= 65535):
-            raise ValueError(f"Invalid port: {self.port}")
-        if self.weight < 1:
-            raise ValueError("weight must be >= 1")
-
-    @property
-    def base_url(self) -> str:
-        return f"{self.protocol.value}://{self.host}:{self.port}"
-
-    @property
-    def health_url(self) -> str:
-        return self.base_url + self.health_endpoint
+class TrafficPolicy:
+    source: str
+    destination: str
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    weight: int = 100
+    timeout_ms: int = 5000
+    retry_count: int = 3
+    circuit_breaker_threshold: int = 5   # failures before opening circuit
+    circuit_breaker_sleep_ms: int = 30000
+    headers: dict = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
 
 
 @dataclass
 class RouteResult:
-    source: str
-    destination: str
-    path: str
-    url: str
-    algorithm: str
+    service_name: str
+    endpoint: str
+    policy_id: Optional[str]
     latency_ms: float = 0.0
     success: bool = True
     error: str = ""
-    timestamp: float = field(default_factory=time.time)
 
 
 @dataclass
 class CircuitBreakerState:
-    service: str
-    state: CircuitState = CircuitState.CLOSED
+    service_name: str
+    state: str = CircuitState.CLOSED.value
     failure_count: int = 0
-    last_failure: float = 0.0
-    last_success: float = 0.0
-    opened_at: float = 0.0
+    last_failure_ts: float = 0.0
+    last_success_ts: float = 0.0
 
     def is_open(self, policy: TrafficPolicy) -> bool:
-        if self.state == CircuitState.CLOSED:
-            return False
-        if self.state == CircuitState.OPEN:
-            if time.time() - self.opened_at > policy.circuit_breaker_timeout:
-                self.state = CircuitState.HALF_OPEN
+        if self.state == CircuitState.OPEN.value:
+            elapsed = (time.time() - self.last_failure_ts) * 1000
+            if elapsed >= policy.circuit_breaker_sleep_ms:
+                self.state = CircuitState.HALF_OPEN.value
                 return False
             return True
-        return False  # HALF_OPEN - allow one request
+        return False
 
     def record_success(self) -> None:
         self.failure_count = 0
-        self.last_success = time.time()
-        self.state = CircuitState.CLOSED
+        self.last_success_ts = time.time()
+        self.state = CircuitState.CLOSED.value
 
     def record_failure(self, policy: TrafficPolicy) -> None:
         self.failure_count += 1
-        self.last_failure = time.time()
-        if self.state == CircuitState.HALF_OPEN:
-            self.state = CircuitState.OPEN
-            self.opened_at = time.time()
-        elif self.failure_count >= policy.circuit_breaker_threshold:
-            self.state = CircuitState.OPEN
-            self.opened_at = time.time()
+        self.last_failure_ts = time.time()
+        if self.failure_count >= policy.circuit_breaker_threshold:
+            self.state = CircuitState.OPEN.value
 
 
 # ---------------------------------------------------------------------------
-# SQLite persistence
+# DB
 # ---------------------------------------------------------------------------
 
-def _init_db(path: Path = DB_PATH) -> sqlite3.Connection:
+def _get_db(path: Path = DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS services (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            name           TEXT NOT NULL UNIQUE,
-            host           TEXT NOT NULL,
-            port           INTEGER NOT NULL,
-            protocol       TEXT NOT NULL DEFAULT 'http',
-            health_endpoint TEXT NOT NULL DEFAULT '/health',
-            version        TEXT NOT NULL DEFAULT 'v1',
-            namespace      TEXT NOT NULL DEFAULT 'default',
-            weight         INTEGER NOT NULL DEFAULT 1,
-            metadata       TEXT NOT NULL DEFAULT '{}',
-            registered_at  REAL NOT NULL,
-            last_seen      REAL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS circuit_breakers (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            service_name  TEXT NOT NULL UNIQUE,
-            state         TEXT NOT NULL DEFAULT 'closed',
-            failure_count INTEGER NOT NULL DEFAULT 0,
-            last_failure  REAL NOT NULL DEFAULT 0,
-            last_success  REAL NOT NULL DEFAULT 0,
-            opened_at     REAL NOT NULL DEFAULT 0
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS route_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            source      TEXT NOT NULL,
-            destination TEXT NOT NULL,
-            path        TEXT NOT NULL,
-            algorithm   TEXT NOT NULL,
-            latency_ms  REAL,
-            success     INTEGER NOT NULL DEFAULT 1,
-            error       TEXT,
-            routed_at   REAL NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS health_checks (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            service_name TEXT NOT NULL,
-            healthy     INTEGER NOT NULL DEFAULT 1,
-            latency_ms  REAL,
-            checked_at  REAL NOT NULL,
-            error       TEXT
-        )
-    """)
-    conn.commit()
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    _ensure_schema(conn)
     return conn
 
 
-# ---------------------------------------------------------------------------
-# Service mesh operations
-# ---------------------------------------------------------------------------
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS services (
+            id               TEXT PRIMARY KEY,
+            name             TEXT NOT NULL,
+            namespace        TEXT NOT NULL DEFAULT 'default',
+            endpoints        TEXT NOT NULL DEFAULT '[]',
+            protocol         TEXT NOT NULL DEFAULT 'http',
+            port             INTEGER NOT NULL DEFAULT 80,
+            health_check_path TEXT NOT NULL DEFAULT '/health',
+            load_balance     TEXT NOT NULL DEFAULT 'round_robin',
+            weight           INTEGER NOT NULL DEFAULT 1,
+            metadata         TEXT NOT NULL DEFAULT '{}',
+            created_at       REAL NOT NULL,
+            UNIQUE(name, namespace)
+        );
 
-_round_robin_counters: dict[str, int] = {}
+        CREATE TABLE IF NOT EXISTS traffic_policies (
+            id                          TEXT PRIMARY KEY,
+            source                      TEXT NOT NULL,
+            destination                 TEXT NOT NULL,
+            weight                      INTEGER NOT NULL DEFAULT 100,
+            timeout_ms                  INTEGER NOT NULL DEFAULT 5000,
+            retry_count                 INTEGER NOT NULL DEFAULT 3,
+            circuit_breaker_threshold   INTEGER NOT NULL DEFAULT 5,
+            circuit_breaker_sleep_ms    INTEGER NOT NULL DEFAULT 30000,
+            headers                     TEXT NOT NULL DEFAULT '{}',
+            created_at                  REAL NOT NULL,
+            UNIQUE(source, destination)
+        );
+
+        CREATE TABLE IF NOT EXISTS circuit_breakers (
+            service_name    TEXT PRIMARY KEY,
+            state           TEXT NOT NULL DEFAULT 'closed',
+            failure_count   INTEGER NOT NULL DEFAULT 0,
+            last_failure_ts REAL NOT NULL DEFAULT 0,
+            last_success_ts REAL NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS rr_counters (
+            service_name TEXT PRIMARY KEY,
+            counter      INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS conn_counts (
+            service_name    TEXT NOT NULL,
+            endpoint        TEXT NOT NULL,
+            active_conns    INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(service_name, endpoint)
+        );
+
+        CREATE TABLE IF NOT EXISTS request_log (
+            id          TEXT PRIMARY KEY,
+            source      TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            endpoint    TEXT NOT NULL,
+            success     INTEGER NOT NULL,
+            latency_ms  REAL NOT NULL,
+            timestamp   REAL NOT NULL
+        );
+    """)
+    conn.commit()
 
 
-def register_service(svc: Service, db: sqlite3.Connection) -> int:
-    """Register a service in the mesh."""
-    now = time.time()
-    cur = db.execute(
-        """INSERT INTO services (name,host,port,protocol,health_endpoint,version,namespace,weight,metadata,registered_at,last_seen)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(name) DO UPDATE SET
-             host=excluded.host, port=excluded.port, protocol=excluded.protocol,
-             weight=excluded.weight, last_seen=excluded.last_seen""",
-        (svc.name, svc.host, svc.port, svc.protocol.value,
-         svc.health_endpoint, svc.version, svc.namespace,
-         svc.weight, json.dumps(svc.metadata), now, now),
-    )
-    # Initialize circuit breaker
-    db.execute(
-        "INSERT OR IGNORE INTO circuit_breakers (service_name) VALUES (?)",
-        (svc.name,),
-    )
-    db.commit()
-    return db.execute("SELECT id FROM services WHERE name=?", (svc.name,)).fetchone()[0]
-
-
-def deregister_service(name: str, db: sqlite3.Connection) -> bool:
-    """Remove a service from the mesh."""
-    row = db.execute("SELECT id FROM services WHERE name=?", (name,)).fetchone()
-    if not row:
-        return False
-    db.execute("DELETE FROM services WHERE name=?", (name,))
-    db.execute("DELETE FROM circuit_breakers WHERE service_name=?", (name,))
-    db.commit()
-    return True
-
-
-def get_service(name: str, db: sqlite3.Connection) -> Optional[Service]:
-    row = db.execute("SELECT * FROM services WHERE name=?", (name,)).fetchone()
-    if not row:
-        return None
-    cols = [d[0] for d in db.execute("SELECT * FROM services LIMIT 0").description]
-    data = dict(zip(cols, row))
+def _row_to_service(row: sqlite3.Row) -> Service:
     return Service(
-        name=data["name"],
-        host=data["host"],
-        port=data["port"],
-        protocol=Protocol(data["protocol"]),
-        health_endpoint=data["health_endpoint"],
-        version=data["version"],
-        namespace=data["namespace"],
-        weight=data["weight"],
-        metadata=json.loads(data.get("metadata", "{}")),
+        id=row["id"],
+        name=row["name"],
+        namespace=row["namespace"],
+        endpoints=json.loads(row["endpoints"]),
+        protocol=row["protocol"],
+        port=row["port"],
+        health_check_path=row["health_check_path"],
+        load_balance=row["load_balance"],
+        weight=row["weight"],
+        created_at=row["created_at"],
+        metadata=json.loads(row["metadata"]),
     )
 
 
-def list_services(namespace: Optional[str] = None, db: sqlite3.Connection = None) -> list[Service]:
-    if db is None:
-        db = _init_db()
+def _row_to_policy(row: sqlite3.Row) -> TrafficPolicy:
+    return TrafficPolicy(
+        id=row["id"],
+        source=row["source"],
+        destination=row["destination"],
+        weight=row["weight"],
+        timeout_ms=row["timeout_ms"],
+        retry_count=row["retry_count"],
+        circuit_breaker_threshold=row["circuit_breaker_threshold"],
+        circuit_breaker_sleep_ms=row["circuit_breaker_sleep_ms"],
+        headers=json.loads(row["headers"]),
+        created_at=row["created_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Service registration
+# ---------------------------------------------------------------------------
+
+def register_service(
+    name: str,
+    endpoints: list[str],
+    protocol: str,
+    port: int,
+    namespace: str = "default",
+    health_check_path: str = "/health",
+    load_balance: str = LoadBalance.ROUND_ROBIN.value,
+    weight: int = 1,
+    metadata: Optional[dict] = None,
+    db: Optional[sqlite3.Connection] = None,
+) -> Service:
+    """Register a new service in the mesh."""
+    conn = db or _get_db()
+    svc = Service(
+        name=name,
+        namespace=namespace,
+        endpoints=endpoints,
+        protocol=protocol,
+        port=port,
+        health_check_path=health_check_path,
+        load_balance=load_balance,
+        weight=weight,
+        metadata=metadata or {},
+    )
+    conn.execute(
+        """INSERT OR REPLACE INTO services
+           (id,name,namespace,endpoints,protocol,port,health_check_path,
+            load_balance,weight,metadata,created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (svc.id, svc.name, svc.namespace, json.dumps(svc.endpoints),
+         svc.protocol, svc.port, svc.health_check_path, svc.load_balance,
+         svc.weight, json.dumps(svc.metadata), svc.created_at),
+    )
+    conn.commit()
+    return svc
+
+
+def deregister_service(name: str, namespace: str = "default", db: Optional[sqlite3.Connection] = None) -> bool:
+    conn = db or _get_db()
+    cur = conn.execute("DELETE FROM services WHERE name=? AND namespace=?", (name, namespace))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def get_service(name: str, namespace: str = "default", db: Optional[sqlite3.Connection] = None) -> Optional[Service]:
+    conn = db or _get_db()
+    row = conn.execute("SELECT * FROM services WHERE name=? AND namespace=?", (name, namespace)).fetchone()
+    return _row_to_service(row) if row else None
+
+
+def list_services(namespace: Optional[str] = None, db: Optional[sqlite3.Connection] = None) -> list[Service]:
+    conn = db or _get_db()
     if namespace:
-        rows = db.execute("SELECT * FROM services WHERE namespace=?", (namespace,)).fetchall()
+        rows = conn.execute("SELECT * FROM services WHERE namespace=?", (namespace,)).fetchall()
     else:
-        rows = db.execute("SELECT * FROM services ORDER BY name").fetchall()
-    cols = [d[0] for d in db.execute("SELECT * FROM services LIMIT 0").description]
-    result = []
-    for row in rows:
-        data = dict(zip(cols, row))
-        result.append(Service(
-            name=data["name"], host=data["host"], port=data["port"],
-            protocol=Protocol(data["protocol"]),
-            health_endpoint=data["health_endpoint"],
-            version=data["version"], namespace=data["namespace"],
-            weight=data["weight"],
-        ))
-    return result
+        rows = conn.execute("SELECT * FROM services").fetchall()
+    return [_row_to_service(r) for r in rows]
 
 
-def circuit_breaker_state(service_name: str, db: sqlite3.Connection) -> CircuitBreakerState:
-    """Get current circuit breaker state for a service."""
-    row = db.execute(
-        "SELECT * FROM circuit_breakers WHERE service_name=?", (service_name,)
-    ).fetchone()
-    if not row:
-        return CircuitBreakerState(service=service_name)
-    cols = [d[0] for d in db.execute("SELECT * FROM circuit_breakers LIMIT 0").description]
-    data = dict(zip(cols, row))
-    return CircuitBreakerState(
-        service=service_name,
-        state=CircuitState(data["state"]),
-        failure_count=data["failure_count"],
-        last_failure=data["last_failure"],
-        last_success=data["last_success"],
-        opened_at=data["opened_at"],
-    )
+# ---------------------------------------------------------------------------
+# Load balancing
+# ---------------------------------------------------------------------------
 
-
-def _update_circuit_breaker(cb: CircuitBreakerState, db: sqlite3.Connection) -> None:
+def _pick_endpoint_round_robin(svc: Service, db: sqlite3.Connection) -> str:
+    if not svc.endpoints:
+        raise RuntimeError(f"No endpoints for {svc.name}")
+    row = db.execute("SELECT counter FROM rr_counters WHERE service_name=?", (svc.name,)).fetchone()
+    idx = row["counter"] if row else 0
+    endpoint = svc.endpoints[idx % len(svc.endpoints)]
     db.execute(
-        """UPDATE circuit_breakers SET state=?,failure_count=?,last_failure=?,
-           last_success=?,opened_at=? WHERE service_name=?""",
-        (cb.state.value, cb.failure_count, cb.last_failure,
-         cb.last_success, cb.opened_at, cb.service),
+        "INSERT OR REPLACE INTO rr_counters (service_name, counter) VALUES (?,?)",
+        (svc.name, idx + 1),
     )
     db.commit()
+    return endpoint
 
 
-def route_request(
-    from_svc: str,
-    to_svc: str,
-    path: str = "/",
-    db: sqlite3.Connection = None,
-    simulate_latency: bool = True,
+def _pick_endpoint_least_conn(svc: Service, db: sqlite3.Connection) -> str:
+    if not svc.endpoints:
+        raise RuntimeError(f"No endpoints for {svc.name}")
+    counts: dict[str, int] = {}
+    for ep in svc.endpoints:
+        row = db.execute(
+            "SELECT active_conns FROM conn_counts WHERE service_name=? AND endpoint=?",
+            (svc.name, ep),
+        ).fetchone()
+        counts[ep] = row["active_conns"] if row else 0
+    return min(counts, key=lambda e: counts[e])
+
+
+def _pick_endpoint_random(svc: Service, _db: sqlite3.Connection) -> str:
+    if not svc.endpoints:
+        raise RuntimeError(f"No endpoints for {svc.name}")
+    return random.choice(svc.endpoints)
+
+
+def _pick_endpoint(svc: Service, db: sqlite3.Connection) -> str:
+    algo = svc.load_balance
+    if algo == LoadBalance.ROUND_ROBIN.value:
+        return _pick_endpoint_round_robin(svc, db)
+    if algo == LoadBalance.LEAST_CONN.value:
+        return _pick_endpoint_least_conn(svc, db)
+    return _pick_endpoint_random(svc, db)
+
+
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+
+def route(
+    source: str,
+    dest_service: str,
+    namespace: str = "default",
+    db: Optional[sqlite3.Connection] = None,
 ) -> RouteResult:
-    """Route a request from one service to another, respecting policies."""
-    if db is None:
-        db = _init_db()
-
-    dest = get_service(to_svc, db)
-    if dest is None:
-        return RouteResult(from_svc, to_svc, path, "", "none", success=False,
-                           error=f"Service '{to_svc}' not found")
-
-    cb = circuit_breaker_state(to_svc, db)
-    if cb.is_open(dest.policy):
-        return RouteResult(from_svc, to_svc, path, dest.base_url + path,
-                           dest.policy.lb_algorithm.value, success=False,
-                           error=f"Circuit breaker OPEN for {to_svc}")
-
-    url = dest.base_url + path
-    latency = random.uniform(5, 150) if simulate_latency else 0.0
-
-    result = RouteResult(
-        source=from_svc, destination=to_svc, path=path,
-        url=url, algorithm=dest.policy.lb_algorithm.value,
-        latency_ms=round(latency, 2),
-    )
-
-    # Log route
-    db.execute(
-        "INSERT INTO route_log (source,destination,path,algorithm,latency_ms,success,routed_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (from_svc, to_svc, path, dest.policy.lb_algorithm.value,
-         latency, int(result.success), time.time()),
-    )
-
-    if result.success:
-        cb.record_success()
-    else:
-        cb.record_failure(dest.policy)
-    _update_circuit_breaker(cb, db)
-    db.commit()
-    return result
-
-
-def health_check(service_name: str, db: sqlite3.Connection, timeout: float = 2.0) -> dict:
-    """Perform health check on a service."""
-    svc = get_service(service_name, db)
+    """Route a request from source to dest_service, applying traffic policies."""
+    conn = db or _get_db()
+    svc = get_service(dest_service, namespace, conn)
     if not svc:
-        return {"service": service_name, "healthy": False, "error": "not found"}
+        return RouteResult(dest_service, "", None, success=False, error=f"service {dest_service} not found")
+
+    policy = _get_policy(source, dest_service, conn)
+    cb = _load_circuit_breaker(dest_service, conn)
+
+    if policy and cb.is_open(policy):
+        return RouteResult(
+            dest_service, "", policy.id, success=False,
+            error=f"circuit breaker OPEN for {dest_service}",
+        )
 
     start = time.time()
-    healthy = False
-    error = ""
-    try:
-        req = urllib.request.Request(svc.health_url, headers={"User-Agent": "blackroad-mesh/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            healthy = resp.status == 200
-    except urllib.error.URLError as e:
-        error = str(e.reason)
-    except Exception as e:
-        error = str(e)
+    endpoint = _pick_endpoint(svc, conn)
+    latency = (time.time() - start) * 1000
 
-    latency_ms = (time.time() - start) * 1000
-    db.execute(
-        "INSERT INTO health_checks (service_name,healthy,latency_ms,checked_at,error) VALUES (?,?,?,?,?)",
-        (service_name, int(healthy), round(latency_ms, 2), time.time(), error),
+    # Log request
+    conn.execute(
+        "INSERT INTO request_log (id,source,destination,endpoint,success,latency_ms,timestamp) VALUES (?,?,?,?,?,?,?)",
+        (str(uuid.uuid4()), source, dest_service, endpoint, 1, latency, time.time()),
     )
-    db.execute("UPDATE services SET last_seen=? WHERE name=?", (time.time(), service_name))
+    conn.commit()
+
+    return RouteResult(
+        service_name=dest_service,
+        endpoint=endpoint,
+        policy_id=policy.id if policy else None,
+        latency_ms=latency,
+        success=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Traffic policies
+# ---------------------------------------------------------------------------
+
+def apply_policy(
+    source: str,
+    destination: str,
+    weight: int = 100,
+    timeout_ms: int = 5000,
+    retry_count: int = 3,
+    circuit_breaker_threshold: int = 5,
+    db: Optional[sqlite3.Connection] = None,
+) -> TrafficPolicy:
+    """Create or replace a traffic policy between source and destination."""
+    conn = db or _get_db()
+    p = TrafficPolicy(
+        source=source,
+        destination=destination,
+        weight=weight,
+        timeout_ms=timeout_ms,
+        retry_count=retry_count,
+        circuit_breaker_threshold=circuit_breaker_threshold,
+    )
+    conn.execute(
+        """INSERT OR REPLACE INTO traffic_policies
+           (id,source,destination,weight,timeout_ms,retry_count,
+            circuit_breaker_threshold,circuit_breaker_sleep_ms,headers,created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (p.id, p.source, p.destination, p.weight, p.timeout_ms, p.retry_count,
+         p.circuit_breaker_threshold, p.circuit_breaker_sleep_ms, json.dumps(p.headers), p.created_at),
+    )
+    conn.commit()
+    return p
+
+
+def _get_policy(source: str, destination: str, db: sqlite3.Connection) -> Optional[TrafficPolicy]:
+    row = db.execute(
+        "SELECT * FROM traffic_policies WHERE source=? AND destination=?", (source, destination)
+    ).fetchone()
+    return _row_to_policy(row) if row else None
+
+
+def list_policies(db: Optional[sqlite3.Connection] = None) -> list[TrafficPolicy]:
+    conn = db or _get_db()
+    return [_row_to_policy(r) for r in conn.execute("SELECT * FROM traffic_policies").fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker
+# ---------------------------------------------------------------------------
+
+def _load_circuit_breaker(service_name: str, db: sqlite3.Connection) -> CircuitBreakerState:
+    row = db.execute("SELECT * FROM circuit_breakers WHERE service_name=?", (service_name,)).fetchone()
+    if row:
+        return CircuitBreakerState(
+            service_name=row["service_name"],
+            state=row["state"],
+            failure_count=row["failure_count"],
+            last_failure_ts=row["last_failure_ts"],
+            last_success_ts=row["last_success_ts"],
+        )
+    return CircuitBreakerState(service_name=service_name)
+
+
+def _save_circuit_breaker(cb: CircuitBreakerState, db: sqlite3.Connection) -> None:
+    db.execute(
+        """INSERT OR REPLACE INTO circuit_breakers
+           (service_name,state,failure_count,last_failure_ts,last_success_ts)
+           VALUES (?,?,?,?,?)""",
+        (cb.service_name, cb.state, cb.failure_count, cb.last_failure_ts, cb.last_success_ts),
+    )
     db.commit()
-    return {"service": service_name, "healthy": healthy, "latency_ms": round(latency_ms, 2), "error": error}
 
 
-def health_check_all(db: sqlite3.Connection) -> list[dict]:
-    """Health check all registered services."""
-    services = list_services(db=db)
-    return [health_check(svc.name, db) for svc in services]
-
-
-def get_service_graph(db: sqlite3.Connection) -> dict:
-    """Return adjacency dict from route log (who calls whom)."""
-    rows = db.execute(
-        "SELECT source,destination,COUNT(*) as calls FROM route_log GROUP BY source,destination"
-    ).fetchall()
-    graph: dict[str, dict] = {}
-    for source, dest, calls in rows:
-        if source not in graph:
-            graph[source] = {}
-        graph[source][dest] = {"calls": calls}
-    return graph
-
-
-def get_traffic_stats(db: sqlite3.Connection) -> dict:
-    """Return mesh-wide traffic statistics."""
-    total = db.execute("SELECT COUNT(*) FROM route_log").fetchone()[0]
-    errors = db.execute("SELECT COUNT(*) FROM route_log WHERE success=0").fetchone()[0]
-    avg_lat = db.execute("SELECT AVG(latency_ms) FROM route_log WHERE success=1").fetchone()[0] or 0
-    top_routes = db.execute(
-        "SELECT source,destination,COUNT(*) FROM route_log GROUP BY source,destination ORDER BY 3 DESC LIMIT 5"
-    ).fetchall()
+def check_circuit_breaker(policy_id: str, db: Optional[sqlite3.Connection] = None) -> dict:
+    """Return circuit breaker status for the policy's destination service."""
+    conn = db or _get_db()
+    row = conn.execute("SELECT * FROM traffic_policies WHERE id=?", (policy_id,)).fetchone()
+    if not row:
+        return {"error": f"policy {policy_id} not found"}
+    policy = _row_to_policy(row)
+    cb = _load_circuit_breaker(policy.destination, conn)
     return {
-        "total_requests": total,
-        "error_count": errors,
-        "error_rate": round(errors / total, 4) if total > 0 else 0,
-        "avg_latency_ms": round(avg_lat, 2),
-        "top_routes": [{"from": r[0], "to": r[1], "count": r[2]} for r in top_routes],
+        "policy_id": policy_id,
+        "source": policy.source,
+        "destination": policy.destination,
+        "circuit_state": cb.state,
+        "failure_count": cb.failure_count,
+        "threshold": policy.circuit_breaker_threshold,
+        "last_failure": cb.last_failure_ts,
+        "last_success": cb.last_success_ts,
+    }
+
+
+def record_outcome(
+    source: str,
+    destination: str,
+    success: bool,
+    db: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Record a request outcome to update circuit breaker state."""
+    conn = db or _get_db()
+    policy = _get_policy(source, destination, conn)
+    cb = _load_circuit_breaker(destination, conn)
+    if success:
+        cb.record_success()
+    elif policy:
+        cb.record_failure(policy)
+    _save_circuit_breaker(cb, conn)
+
+
+# ---------------------------------------------------------------------------
+# Topology & config export
+# ---------------------------------------------------------------------------
+
+def mesh_topology(db: Optional[sqlite3.Connection] = None) -> dict:
+    """Return a graph of all services and their traffic policies."""
+    conn = db or _get_db()
+    services = list_services(db=conn)
+    policies = list_policies(db=conn)
+    rows = conn.execute(
+        "SELECT destination, COUNT(*) as reqs, AVG(latency_ms) as avg_lat, SUM(success) as ok FROM request_log GROUP BY destination"
+    ).fetchall()
+    stats: dict[str, dict] = {r["destination"]: dict(r) for r in rows}
+
+    nodes = [
+        {
+            "id": s.id,
+            "name": s.name,
+            "namespace": s.namespace,
+            "protocol": s.protocol,
+            "port": s.port,
+            "load_balance": s.load_balance,
+            "endpoints": s.endpoints,
+            "stats": stats.get(s.name, {}),
+        }
+        for s in services
+    ]
+    edges = [
+        {
+            "id": p.id,
+            "source": p.source,
+            "destination": p.destination,
+            "weight": p.weight,
+            "timeout_ms": p.timeout_ms,
+            "retry_count": p.retry_count,
+            "circuit_breaker_threshold": p.circuit_breaker_threshold,
+        }
+        for p in policies
+    ]
+    return {"nodes": nodes, "edges": edges, "service_count": len(nodes), "policy_count": len(edges)}
+
+
+def export_config(db: Optional[sqlite3.Connection] = None) -> dict:
+    """Export the full mesh configuration as a serializable dict."""
+    conn = db or _get_db()
+    topology = mesh_topology(db=conn)
+    cb_rows = conn.execute("SELECT * FROM circuit_breakers").fetchall()
+    circuit_breakers = [dict(r) for r in cb_rows]
+
+    return {
+        "version": "1.0",
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "topology": topology,
+        "circuit_breakers": circuit_breakers,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Health checking
+# ---------------------------------------------------------------------------
+
+def health_check(service_name: str, namespace: str = "default", timeout: float = 2.0, db: Optional[sqlite3.Connection] = None) -> dict:
+    conn = db or _get_db()
+    svc = get_service(service_name, namespace, conn)
+    if not svc:
+        return {"service": service_name, "healthy": False, "error": "not found"}
+    results = []
+    for ep in svc.endpoints:
+        url = f"{svc.protocol}://{ep}:{svc.port}{svc.health_check_path}"
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                latency = (time.time() - t0) * 1000
+                results.append({"endpoint": ep, "status": resp.status, "latency_ms": latency, "healthy": resp.status < 400})
+        except Exception as exc:
+            results.append({"endpoint": ep, "healthy": False, "error": str(exc)})
+    return {
+        "service": service_name,
+        "healthy": all(r["healthy"] for r in results),
+        "endpoints": results,
     }
 
 
@@ -434,117 +584,63 @@ def get_traffic_stats(db: sqlite3.Connection) -> dict:
 # CLI
 # ---------------------------------------------------------------------------
 
-def _cmd_register(args: argparse.Namespace) -> None:
-    db = _init_db()
-    svc = Service(
-        name=args.name, host=args.host, port=args.port,
-        protocol=Protocol(args.protocol),
-        health_endpoint=args.health_endpoint,
-        namespace=args.namespace,
-    )
-    sid = register_service(svc, db)
-    print(f"Registered service '{svc.name}' (id={sid}) at {svc.base_url}")
+def _cli_main() -> None:
+    import argparse, sys
 
-
-def _cmd_list(args: argparse.Namespace) -> None:
-    db = _init_db()
-    services = list_services(db=db)
-    if not services:
-        print("No services registered.")
-        return
-    print(f"{'NAME':<20} {'HOST':<20} {'PORT':<6} {'PROTOCOL':<10} {'NAMESPACE'}")
-    print("-" * 70)
-    for s in services:
-        print(f"{s.name:<20} {s.host:<20} {s.port:<6} {s.protocol.value:<10} {s.namespace}")
-
-
-def _cmd_route(args: argparse.Namespace) -> None:
-    db = _init_db()
-    result = route_request(args.from_svc, args.to_svc, args.path, db)
-    status = "✅" if result.success else "❌"
-    print(f"{status} {result.source} → {result.destination}{result.path}")
-    if result.success:
-        print(f"  URL:     {result.url}")
-        print(f"  Latency: {result.latency_ms}ms")
-    else:
-        print(f"  Error:   {result.error}")
-
-
-def _cmd_health(args: argparse.Namespace) -> None:
-    db = _init_db()
-    if args.service:
-        r = health_check(args.service, db)
-        status = "✅" if r["healthy"] else "❌"
-        print(f"{status} {r['service']}: {r.get('latency_ms', 0):.1f}ms {r.get('error','')}")
-    else:
-        results = health_check_all(db)
-        for r in results:
-            status = "✅" if r["healthy"] else "❌"
-            print(f"{status} {r['service']}: {r.get('latency_ms', 0):.1f}ms")
-
-
-def _cmd_graph(args: argparse.Namespace) -> None:
-    db = _init_db()
-    graph = get_service_graph(db)
-    print(json.dumps(graph, indent=2))
-
-
-def _cmd_stats(args: argparse.Namespace) -> None:
-    db = _init_db()
-    stats = get_traffic_stats(db)
-    print(json.dumps(stats, indent=2))
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="BlackRoad Service Mesh")
-    sub = parser.add_subparsers(dest="command")
+    p = argparse.ArgumentParser(prog="service_mesh", description="BlackRoad Service Mesh")
+    sub = p.add_subparsers(dest="cmd")
 
     reg = sub.add_parser("register", help="Register a service")
-    reg.add_argument("--name", required=True)
-    reg.add_argument("--host", required=True)
-    reg.add_argument("--port", type=int, required=True)
-    reg.add_argument("--protocol", default="http", choices=["http", "https", "grpc", "tcp"])
-    reg.add_argument("--health-endpoint", default="/health")
+    reg.add_argument("name")
+    reg.add_argument("--endpoints", required=True, help="comma-separated host:port list")
+    reg.add_argument("--protocol", default="http")
+    reg.add_argument("--port", type=int, default=80)
     reg.add_argument("--namespace", default="default")
+    reg.add_argument("--lb", default="round_robin", dest="load_balance")
 
-    sub.add_parser("list", help="List registered services")
+    sub.add_parser("list", help="List services")
 
-    route = sub.add_parser("route", help="Simulate a routed request")
-    route.add_argument("from_svc")
-    route.add_argument("to_svc")
-    route.add_argument("--path", default="/")
+    rt = sub.add_parser("route", help="Route from source to destination")
+    rt.add_argument("source")
+    rt.add_argument("dest")
+    rt.add_argument("--namespace", default="default")
 
-    health = sub.add_parser("health", help="Health check services")
-    health.add_argument("--service", default=None)
+    pol = sub.add_parser("policy", help="Apply a traffic policy")
+    pol.add_argument("source")
+    pol.add_argument("dest")
+    pol.add_argument("--weight", type=int, default=100)
+    pol.add_argument("--timeout", type=int, default=5000, dest="timeout_ms")
+    pol.add_argument("--retries", type=int, default=3, dest="retry_count")
 
-    sub.add_parser("graph", help="Show service dependency graph")
-    sub.add_parser("stats", help="Show traffic statistics")
+    sub.add_parser("topology", help="Show mesh topology")
+    sub.add_parser("export", help="Export mesh config as JSON")
 
-    dreg = sub.add_parser("deregister", help="Remove a service")
-    dreg.add_argument("name")
+    args = p.parse_args()
+    db = _get_db()
 
-    return parser
-
-
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-    dispatch = {
-        "register": _cmd_register, "list": _cmd_list, "route": _cmd_route,
-        "health": _cmd_health, "graph": _cmd_graph, "stats": _cmd_stats,
-    }
-    if args.command == "deregister":
-        db = _init_db()
-        if deregister_service(args.name, db):
-            print(f"Deregistered '{args.name}'")
-        else:
-            print(f"Service '{args.name}' not found", file=sys.stderr)
-            sys.exit(1)
-    elif args.command in dispatch:
-        dispatch[args.command](args)
+    if args.cmd == "register":
+        endpoints = [e.strip() for e in args.endpoints.split(",")]
+        svc = register_service(args.name, endpoints, args.protocol, args.port,
+                               namespace=args.namespace, load_balance=args.load_balance, db=db)
+        print(json.dumps({"id": svc.id, "name": svc.name}, indent=2))
+    elif args.cmd == "list":
+        svcs = list_services(db=db)
+        print(json.dumps([{"name": s.name, "ns": s.namespace, "endpoints": s.endpoints} for s in svcs], indent=2))
+    elif args.cmd == "route":
+        result = route(args.source, args.dest, namespace=args.namespace, db=db)
+        print(json.dumps(result.__dict__, indent=2))
+    elif args.cmd == "policy":
+        pol_obj = apply_policy(args.source, args.dest, weight=args.weight,
+                               timeout_ms=args.timeout_ms, retry_count=args.retry_count, db=db)
+        print(json.dumps({"id": pol_obj.id}, indent=2))
+    elif args.cmd == "topology":
+        print(json.dumps(mesh_topology(db=db), indent=2))
+    elif args.cmd == "export":
+        print(json.dumps(export_config(db=db), indent=2))
     else:
-        parser.print_help()
+        p.print_help()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    _cli_main()
