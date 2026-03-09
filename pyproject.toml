@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "blackroad_service_mesh"
+version = "0.1.0"
+description = "BlackRoad OS — blackroad_service_mesh"
+authors = [{name = "Alexa Amundson", email = "amundsonalexa@gmail.com"}]
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
