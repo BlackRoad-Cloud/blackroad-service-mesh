@@ -11,6 +11,8 @@ from service_mesh import (
     apply_policy, list_policies, check_circuit_breaker, route,
     mesh_topology, export_config, health_check, record_outcome,
     _get_db, Protocol, LoadBalance, CircuitState,
+    OLLAMA_ALIASES, OLLAMA_SERVICE_NAME, OLLAMA_DEFAULT_HOST, OLLAMA_DEFAULT_PORT,
+    resolve_mention, _ensure_ollama_registered, ollama_chat,
 )
 
 
@@ -182,3 +184,115 @@ def test_service_health_url():
     svc = Service(name="x", namespace="default", endpoints=["10.0.0.1"],
                   protocol="http", port=80, health_check_path="/ping")
     assert svc.health_url() == "http://10.0.0.1:80/ping"
+
+
+# ---------------------------------------------------------------------------
+# Ollama alias routing
+# ---------------------------------------------------------------------------
+
+def test_ollama_aliases_set():
+    """All expected @mention aliases are present in OLLAMA_ALIASES."""
+    for alias in ("@ollama", "@copilot", "@lucidia", "@blackboxprogramming"):
+        assert alias in OLLAMA_ALIASES
+
+
+def test_resolve_mention_known(db):
+    for alias in OLLAMA_ALIASES:
+        assert resolve_mention(alias) == OLLAMA_SERVICE_NAME
+
+
+def test_resolve_mention_case_insensitive(db):
+    assert resolve_mention("@OLLAMA") == OLLAMA_SERVICE_NAME
+    assert resolve_mention("@Copilot") == OLLAMA_SERVICE_NAME
+
+
+def test_resolve_mention_unknown():
+    assert resolve_mention("@openai") is None
+    assert resolve_mention("@claude") is None
+    assert resolve_mention("random") is None
+
+
+def test_ensure_ollama_registered_creates_service(db):
+    svc = _ensure_ollama_registered(db=db)
+    assert svc.name == OLLAMA_SERVICE_NAME
+    assert svc.port == OLLAMA_DEFAULT_PORT
+    assert svc.health_check_path == "/api/tags"
+
+
+def test_ensure_ollama_registered_idempotent(db):
+    svc1 = _ensure_ollama_registered(db=db)
+    svc2 = _ensure_ollama_registered(db=db)
+    # Second call must not create a duplicate
+    assert svc1.name == svc2.name
+    ollama_svcs = [s for s in list_services(db=db) if s.name == OLLAMA_SERVICE_NAME]
+    assert len(ollama_svcs) == 1
+
+
+def test_ollama_chat_unknown_mention(db):
+    result = ollama_chat("@openai", "hello", db=db)
+    assert not result["success"]
+    assert "unknown mention" in result["error"]
+    assert result["service"] is None
+
+
+def test_ollama_chat_routes_through_mesh(db, monkeypatch):
+    """ollama_chat should resolve alias → register Ollama → call /api/chat."""
+    import io
+    import urllib.request
+
+    fake_body = json.dumps({
+        "message": {"role": "assistant", "content": "Hello from Ollama!"}
+    }).encode()
+
+    class FakeResponse:
+        status = 200
+        def read(self):
+            return fake_body
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: FakeResponse())
+
+    for alias in OLLAMA_ALIASES:
+        result = ollama_chat(alias, "test prompt", db=db)
+        assert result["success"], f"Expected success for {alias}: {result['error']}"
+        assert result["service"] == OLLAMA_SERVICE_NAME
+        assert result["response"] == "Hello from Ollama!"
+        assert result["mention"] == alias
+
+
+def test_ollama_chat_records_failure_on_error(db, monkeypatch):
+    """A network error must record a circuit-breaker failure and return success=False."""
+    import urllib.request
+
+    def boom(req, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+
+    result = ollama_chat("@ollama", "ping", db=db)
+    assert not result["success"]
+    assert "connection refused" in result["error"]
+
+
+def test_ollama_chat_no_external_provider(db, monkeypatch):
+    """Verify that ollama_chat never contacts any host other than the Ollama host."""
+    import urllib.request
+
+    intercepted_urls: list[str] = []
+
+    def capture(req, timeout=None):
+        intercepted_urls.append(req.full_url)
+        raise OSError("blocked")
+
+    monkeypatch.setattr(urllib.request, "urlopen", capture)
+
+    ollama_chat("@copilot", "hello", host="127.0.0.1", port=11434, db=db)
+
+    for url in intercepted_urls:
+        assert "127.0.0.1" in url, f"Unexpected external URL contacted: {url}"
+        assert "openai" not in url
+        assert "anthropic" not in url
+        assert "github.com" not in url

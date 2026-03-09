@@ -21,6 +21,24 @@ import urllib.error
 DB_PATH = Path.home() / ".blackroad" / "service_mesh.db"
 
 # ---------------------------------------------------------------------------
+# Ollama — all @mention aliases resolve to the local Ollama service.
+# No external AI provider is contacted.
+# ---------------------------------------------------------------------------
+
+OLLAMA_SERVICE_NAME = "ollama"
+OLLAMA_DEFAULT_HOST = "localhost"
+OLLAMA_DEFAULT_PORT = 11434
+
+# Every @mention listed here is treated as a request to the local Ollama
+# instance.  Add new aliases here without touching any other code.
+OLLAMA_ALIASES: frozenset[str] = frozenset({
+    "@ollama",
+    "@copilot",
+    "@lucidia",
+    "@blackboxprogramming",
+})
+
+# ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
 
@@ -581,6 +599,133 @@ def health_check(service_name: str, namespace: str = "default", timeout: float =
 
 
 # ---------------------------------------------------------------------------
+# Ollama routing helpers
+# ---------------------------------------------------------------------------
+
+def resolve_mention(mention: str) -> Optional[str]:
+    """Return the service name for a @mention, or None if unrecognised.
+
+    All aliases in OLLAMA_ALIASES map to OLLAMA_SERVICE_NAME so that callers
+    never need to hard-code the list themselves.
+    """
+    if mention.lower() in OLLAMA_ALIASES:
+        return OLLAMA_SERVICE_NAME
+    return None
+
+
+def _ensure_ollama_registered(
+    host: str = OLLAMA_DEFAULT_HOST,
+    port: int = OLLAMA_DEFAULT_PORT,
+    db: Optional[sqlite3.Connection] = None,
+) -> Service:
+    """Auto-register the local Ollama service in the mesh if not present."""
+    conn = db or _get_db()
+    svc = get_service(OLLAMA_SERVICE_NAME, db=conn)
+    if not svc:
+        svc = register_service(
+            name=OLLAMA_SERVICE_NAME,
+            endpoints=[host],
+            protocol="http",
+            port=port,
+            health_check_path="/api/tags",
+            metadata={"aliases": sorted(OLLAMA_ALIASES)},
+            db=conn,
+        )
+    return svc
+
+
+def ollama_chat(
+    mention: str,
+    prompt: str,
+    model: str = "llama3",
+    host: str = OLLAMA_DEFAULT_HOST,
+    port: int = OLLAMA_DEFAULT_PORT,
+    timeout: float = 120.0,
+    db: Optional[sqlite3.Connection] = None,
+) -> dict:
+    """Send *prompt* to the local Ollama service, routing via the mesh.
+
+    *mention* must be one of the aliases in OLLAMA_ALIASES (e.g. ``@ollama``,
+    ``@copilot``, ``@lucidia``, ``@blackboxprogramming``).  No external AI
+    provider is contacted — all traffic goes directly to the Ollama instance
+    running at *host*:*port*.
+
+    Returns a dict with keys: mention, service, endpoint, model, response,
+    success, error.
+    """
+    conn = db or _get_db()
+
+    service_name = resolve_mention(mention)
+    if service_name is None:
+        return {
+            "mention": mention,
+            "service": None,
+            "endpoint": None,
+            "model": model,
+            "response": None,
+            "success": False,
+            "error": (
+                f"unknown mention '{mention}'; "
+                f"recognised aliases: {sorted(OLLAMA_ALIASES)}"
+            ),
+        }
+
+    _ensure_ollama_registered(host=host, port=port, db=conn)
+    route_result = route("__mesh__", service_name, db=conn)
+
+    if not route_result.success:
+        return {
+            "mention": mention,
+            "service": service_name,
+            "endpoint": None,
+            "model": model,
+            "response": None,
+            "success": False,
+            "error": route_result.error,
+        }
+
+    endpoint = route_result.endpoint
+    url = f"http://{endpoint}:{port}/api/chat"
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }).encode()
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read())
+            response_text = body.get("message", {}).get("content", "")
+            record_outcome("__mesh__", service_name, success=True, db=conn)
+            return {
+                "mention": mention,
+                "service": service_name,
+                "endpoint": endpoint,
+                "model": model,
+                "response": response_text,
+                "success": True,
+                "error": "",
+            }
+    except Exception as exc:
+        record_outcome("__mesh__", service_name, success=False, db=conn)
+        return {
+            "mention": mention,
+            "service": service_name,
+            "endpoint": endpoint,
+            "model": model,
+            "response": None,
+            "success": False,
+            "error": str(exc),
+        }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -615,6 +760,13 @@ def _cli_main() -> None:
     sub.add_parser("topology", help="Show mesh topology")
     sub.add_parser("export", help="Export mesh config as JSON")
 
+    chat_p = sub.add_parser("chat", help="Send a prompt to Ollama via a @mention alias")
+    chat_p.add_argument("mention", help="e.g. @ollama, @copilot, @lucidia, @blackboxprogramming")
+    chat_p.add_argument("prompt", help="The prompt to send")
+    chat_p.add_argument("--model", default="llama3", help="Ollama model name (default: llama3)")
+    chat_p.add_argument("--host", default=OLLAMA_DEFAULT_HOST)
+    chat_p.add_argument("--port", type=int, default=OLLAMA_DEFAULT_PORT)
+
     args = p.parse_args()
     db = _get_db()
 
@@ -637,6 +789,10 @@ def _cli_main() -> None:
         print(json.dumps(mesh_topology(db=db), indent=2))
     elif args.cmd == "export":
         print(json.dumps(export_config(db=db), indent=2))
+    elif args.cmd == "chat":
+        result = ollama_chat(args.mention, args.prompt, model=args.model,
+                             host=args.host, port=args.port, db=db)
+        print(json.dumps(result, indent=2))
     else:
         p.print_help()
         sys.exit(1)
